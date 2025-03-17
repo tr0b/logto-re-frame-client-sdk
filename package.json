@@ -1,0 +1,11 @@
+{
+  "name": "logto-re-frame-client.cljs",
+  "scripts": {},
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "dependencies": {
+    "js-cookie": "^3.0.5"
+  }
+}

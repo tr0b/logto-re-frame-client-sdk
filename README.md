@@ -19,7 +19,7 @@ This is a ClojureScript implementation of the Logto Client SDK for use with re-f
 Add the following dependency to your project.clj or deps.edn:
 
 ```clojure
-[logto-client "0.1.0"]
+[logto-client "0.0.1"]
 ```
 
 ## Usage

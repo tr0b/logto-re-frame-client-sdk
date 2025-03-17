@@ -20,6 +20,10 @@ This is a ClojureScript implementation of the Logto Client SDK for use with re-f
 
 Add the following dependency to your project.clj or deps.edn:
 
+```
+com.github.tr0b/logto-re-frame-client-sdk {:mvn/version "0.0.8"}
+
+```
 ```clojure
 [logto-client "0.0.1"]
 ```

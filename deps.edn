@@ -4,4 +4,8 @@
         cljs-ajax/cljs-ajax {:mvn/version "0.8.4"}
         day8.re-frame/http-fx {:mvn/version "0.2.4"}
         slipset/deps-deploy {:mvn/version "0.2.2"}
-        thheller/shadow-cljs {:mvn/version "2.28.21"}}}
+        thheller/shadow-cljs {:mvn/version "2.28.21"}}
+ :aliases
+ {:build {:deps {io.github.clojure/tools.build {:git/tag "v0.6.2" :git/sha "226fb52"}
+                 slipset/deps-deploy {:mvn/version "RELEASE"}}                            ; <-- new dependency
+          :ns-default build}}}

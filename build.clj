@@ -11,12 +11,19 @@
 (defn clean [_]
   (b/delete {:path "target"}))
 
+(def pom-template
+  [[:licenses
+    [:license
+     [:name "MIT"]
+     [:url "https://www.mit.edu/~amini/LICENSE.md"]]]])
+
 (defn jar [_]
   (b/write-pom {:class-dir class-dir
                 :lib lib
                 :version version
                 :basis basis
-                :src-dirs ["src"]})
+                :src-dirs ["src"]
+                :pom-data pom-template})
   (b/copy-dir {:src-dirs ["src" "resources"]
                :target-dir class-dir})
   (b/jar {:class-dir class-dir

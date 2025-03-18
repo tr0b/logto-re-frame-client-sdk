@@ -304,3 +304,5 @@
  :cookie/remove
  (fn [name]
    (.remove Cookies name)))
+
+(js/console.log "logto-client.core loaded")

@@ -342,11 +342,6 @@
  (fn [db]
    (:auth-config db)))
 
-(re-frame/reg-sub
- ::error
- (fn [db _]
-   (get-in db [:logto :error])))
-
 ;; --- Cookie fx --- (TODO: might be invalid. or can be used as replacement for the save-tokens! function above)
 ;; (rf/reg-fx
 ;;  :cookie/set

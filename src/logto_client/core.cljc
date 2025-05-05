@@ -1,308 +1,361 @@
 (ns logto-client.core
   (:require
+   [re-frame.core :as re-frame]
    [clojure.string :as str]
-   [re-frame.core :as rf]
-   [day8.re-frame.http-fx]
-   [ajax.core :as ajax]
-   [goog.crypt.base64 :as b64]
-   ["js-cookie" :as Cookies]))
+   [shadow.cljs.modern :refer (js-await)]
+   [lambdaisland.uri :refer [map->query-string query-map]]
+   ["dayjs" :as dayjs]
+   [goog.crypt :as crypt]
+   [goog.crypt.base64 :as base64]))
 
-;; --- DB structure ---
-;; {:logto {:config {...}
-;;          :tokens {:id-token "..."
-;;                   :refresh-token "..."
-;;                   :access-tokens {"resource" {:token "..." :expires-at timestamp}}}
-;;          :user-info {...}
-;;          :oidc-config {...}}}
+;; -- View actions for sign-in/sign-out buttons
 
-;; --- Config ---
+(def redirect-uri "http://localhost:3000/callback")
+
+;; (defn handle-sign-in []
+;;   #(re-frame/dispatch [::events/sign-in redirect-uri]))
+;; 
+;; (defn handle-sign-out []
+;;  ; #(re-frame/dispatch [::events/sign-out redirect-uri])
+;;   (js/console.error "SIGN OUT NOT IMPLEMENTED YET. WIP"))
+
+;; --- Config (re-frame DB default values) ---
 (defonce default-config
-  {:endpoint nil
-   :app-id nil
-   :scopes ["openid" "profile" "email"]})
+  {:logto-base-endpoint "http://localhost:3001/"
+   :logto-oidc-endpoint "http://localhost:3001/oidc/.well-known/openid-configuration"
+   :auth-token-loading? false
+   :authenticated? false
+   :oidc-config-loading? false
+   :auth-config {:app-id "rn6fs3o60ww1spaht9c4r"
+                 :scopes ["openid" "profile" "email"]
+                 :resources []
+                 :oidc-config nil}
+   :auth-tokens nil
+   :user-info nil})
 
 (defonce cookie-expire-time
   1800 ;; 30 minutes
   )
 
 ;; --- Utility functions ---
-(defn random-string [length]
-  (let [chars "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789"
-        chars-length (count chars)]
-    (apply str (repeatedly length #(nth chars (rand-int chars-length))))))
 
-(defn sha256 [message]
-  (let [hash (js/crypto.subtle.digest "SHA-256" (js/TextEncoder. "utf-8") .encode message)]
-    ;; Convert to ArrayBuffer and then to Base64 URL format
-    ;; This is a simplified version - in a real implementation you'd use a Promise
-    (-> hash
-        (.then (fn [buffer]
-                 (let [bytes (js/Uint8Array. buffer)
-                       base64 (b64/encodeByteArray bytes)]
-                   (-> base64
-                       (str/replace #"\+/=" "-_")
-                       (str/replace #"=" ""))))))))
+(def date-time-zone-format "YYYY-MM-DD HH:mm:ss ZZ")
 
-(defn code-challenge-from-verifier [verifier]
-  (sha256 verifier))
+(defn add-minutes [minutes ^js dayjs-object]
+  "Adds minutes to now datetime (requires dayjs). Returns UNIX timestamp string."
+  (.unix (.add dayjs-object minutes "minute") date-time-zone-format))
 
-(defn query-string [params]
-  (str/join "&" (map (fn [[k v]] (str (name k) "=" (js/encodeURIComponent v))) params)))
+(def oidc-discovery-path
+  "/oidc/.well-known/openid-configuration")
 
-(defn parse-query-string [query-string]
-  (let [query (if (str/starts-with? query-string "?")
-                (subs query-string 1)
-                query-string)]
-    (into {} (for [pair (str/split query #"&")]
-               (let [[k v] (str/split pair #"=")]
-                 [k (js/decodeURIComponent v)])))))
+(defn base-64-uri-safe-string [uint8array]
+  (let [base-64-string (str/join "" (map js/String.fromCharCode uint8array))]
+    (-> base-64-string
+        (js/btoa)
+        (str/replace #"=" "")
+        (str/replace #"[+\/]" (fn [matched]
+                                (if (= matched "+")
+                                  "-"
+                                  "_"))))))
+
+(defn random-string
+  "Generates a random string for code-verifier challenge"
+  ([] (random-string 64))
+  ([length]
+   (let [array (js/crypto.getRandomValues (js/Uint8Array. length))]
+     (base-64-uri-safe-string (array-seq array)))))
+
+(defn generate-pkce-code-challenge
+  "Generates a code challenge from a code verifier."
+  [code-verifier]
+  (let [encoded-code-verifier (.encode (js/TextEncoder.) code-verifier)]
+    (js-await [result (js/crypto.subtle.digest "SHA-256" encoded-code-verifier)]
+              (base-64-uri-safe-string (js/Uint8Array. result))
+              (catch error
+                     (js/console.error "Error generating PKCE code challenge:" error)
+                nil))))
+
+;; New declarative signIn function and supporting functions
+(defn create-pkce []
+  (let [code-verifier (random-string)]
+    (js-await [code-challenge (generate-pkce-code-challenge code-verifier)]
+              {:code-verifier code-verifier
+               :code-challenge code-challenge})))
+
+(defn create-auth-params [{:keys [app-id redirect-uri pkce state scopes resources]}]
+  (let [reserved-scopes ["openid" "offline_access" "profile"]
+        all-scopes (concat reserved-scopes scopes)
+        base-params {:client_id app-id
+                     :redirect_uri redirect-uri
+                     :code_challenge (:code-challenge pkce)
+                     :code_challenge_method "S256"
+                     :state state
+                     :response_type "code"
+                     :prompt "consent"
+                     :scope (str/join " " all-scopes)}]
+    (if (seq resources)
+      (assoc base-params :resource resources)
+      base-params)))
+
+(defn store-sign-in-session! [data]
+  (.setItem js/sessionStorage "sign-in-session" (js/JSON.stringify (clj->js data))))
+
+(defn save-tokens! [data]
+  (let [refresh-token (:refresh_token data)
+        id-token (:id_token data)
+        access-token (:access_token data)
+        expires_in (:expires_in data)]
+    (.setItem js/sessionStorage "refresh-token" refresh-token)
+    (.setItem js/sessionStorage "id-token" id-token)
+    (.setItem js/sessionStorage "" (js/JSON.stringify (clj->js {:token access-token
+                                                                :expires_at (add-minutes expires_in (dayjs))})))))
+
+(defn get-sign-in-session []
+  (let [session-data (.getItem js/sessionStorage "sign-in-session")]
+    (js->clj (js/JSON.parse session-data) :keywordize-keys true)))
+
+(defn verify-and-parse-code-from-callback-uri
+  "Verifies the callback URI and extracts the authorization code.
+   Returns {:error <error msg> :code nil} if it fails to verify/parse 
+   Returns {:error nil :code string} if it successfully verifies/parses"
+  [callback-uri redirect-uri state]
+  (let [parameters (query-map callback-uri)]
+
+    ;; Check if callback URI starts with redirect URI
+    (when-not (str/starts-with? callback-uri redirect-uri)
+      {:error "redirect_uri_mismatched"})
+
+    ;; Check for error messages
+    (let [{error :error
+           error-description :error_description
+           callback-state :state
+           code :code} parameters]
+
+      (when (or error error-description)
+        {:error (str error ":" error-description)})
+
+      (when-not (= callback-state state)
+        {:error "state_mismatch"})
+
+      (when-not nil
+        {:error "authorization_code_not_found"})
+      {:error nil :code code})))
+
+(defn redirect! [url]
+  (set! (.-location js/window) url))
+
+(defn sign-in
+  "Declarative implementation of signIn function"
+  [{:keys [app-id resources scopes oidc-config]} redirect-uri]
+  (let [state (random-string)]
+    (js-await [pkce (create-pkce)]
+              (let [auth-params (create-auth-params {:app-id app-id
+                                                     :redirect-uri redirect-uri
+                                                     :pkce pkce
+                                                     :state state
+                                                     :scopes scopes
+                                                     :resources resources})
+                    query-string (map->query-string auth-params)
+                    external-auth-url (str (:authorization_endpoint oidc-config) "?" query-string)]
+
+                ;; Store session for verification later
+                (store-sign-in-session! {:redirect-uri redirect-uri
+                                         :state state
+                                         :code-verifier (:code-verifier pkce)})
+
+                ;; Navigate to authorization URL
+                (redirect! external-auth-url)))))
+
+(defn base64-url-decode
+  "Decode base64url encoded string"
+  [s]
+  (let [s (-> s
+              (str/replace #"-" "+")
+              (str/replace #"_" "/")
+              ;; Add padding if needed
+              (#(if (zero? (mod (count %) 4))
+                  %
+                  (str % (apply str (repeat (- 4 (mod (count %) 4)) "="))))))]
+    (base64/decodeString s)))
+
+(defn decode-jwt-payload
+  "Decode JWT payload using Closure libraries"
+  [token]
+  (let [[_ payload-b64] (str/split token #"\.")]
+    (try
+      (let [decoded-payload (base64-url-decode payload-b64)
+            payload-str (crypt/byteArrayToString
+                         (crypt/stringToByteArray decoded-payload))]
+        (js->clj (js/JSON.parse payload-str) :keywordize-keys true))
+      (catch :default e
+        (js/console.error "Error decoding JWT payload:" e)
+        nil))))
+
+(defn token-expired?
+  "Check if JWT is expired"
+  [decoded-token]
+  (let [current-time (/ (.now js/Date) 1000)]
+    (> current-time (:exp decoded-token))))
+
+(defn token-claims
+  "Extract specific claims from JWT"
+  [decoded-token]
+  (select-keys decoded-token [:sub :iss :aud :exp :iat]))
+
+(defn token-aud-matches?
+  [decoded-token app-id]
+  (= (:aud decoded-token) app-id))
+
+(defn token-iss-matches?
+  [decoded-token issuer]
+  (= (:iss decoded-token) issuer))
 
 ;; --- Events ---
-(rf/reg-event-db
- ::initialize-logto
- (fn [db [_ config]]
-   (let [merged-config (merge default-config config)]
-     (assoc-in db [:logto :config] merged-config))))
+;; LOGTO SDK
 
-(rf/reg-event-fx
- ::fetch-oidc-config
- (fn [{:keys [db]} _]
-   (let [endpoint (get-in db [:logto :config :endpoint])]
-     {:http-xhrio {:method :get
-                   :uri (str endpoint "/.well-known/openid-configuration")
-                   :response-format (ajax/json-response-format {:keywords? true})
-                   :on-success [::fetch-oidc-config-success]
-                   :on-failure [::request-failed]}})))
+(defn http-oidc-config [db callback-uri success-event]
+  {:db (assoc db :oidc-config-loading? true)
+   :http-xhrio {:method          :get
+                :uri             (:logto-oidc-endpoint db)
+                :timeout         5000
+                :response-format (ajax/json-response-format {:keywords? true})
+                :on-success      [success-event callback-uri]
+                :on-failure      [::handle-failure-fetch-oidc-config]}})
 
-(rf/reg-event-db
- ::fetch-oidc-config-success
- (fn [db [_ response]]
-   (assoc-in db [:logto :oidc-config] response)))
-
-(rf/reg-event-fx
- ::fetch-jwks
- (fn [{:keys [db]} _]
-   (let [jwks-uri (get-in db [:logto :oidc-config :jwks_uri])]
-     {:http-xhrio {:method :get
-                   :uri jwks-uri
-                   :response-format (ajax/json-response-format {:keywords? true})
-                   :on-success [::fetch-jwks-success]
-                   :on-failure [::request-failed]}})))
-
-(rf/reg-event-db
- ::fetch-jwks-success
- (fn [db [_ response]]
-   (assoc-in db [:logto :jwks] response)))
-
-(rf/reg-event-fx
+(re-frame/reg-event-fx
  ::sign-in
- (fn [{:keys [db]} [_ redirect-uri]]
-   (let [{:keys [endpoint app-id scopes]} (get-in db [:logto :config])
-         authorization-endpoint (get-in db [:logto :oidc-config :authorization_endpoint])
-         code-verifier (random-string 64)
-         code-challenge (code-challenge-from-verifier code-verifier)
-         state (random-string 16)
-         params {:response_type "code"
-                 :client_id app-id
-                 :redirect_uri redirect-uri
-                 :scope (str/join " " scopes)
-                 :state state
-                 :code_challenge code-challenge
-                 :code_challenge_method "S256"
-                 :prompt "consent"}
-         auth-url (str authorization-endpoint "?" (query-string params))]
-     {:db (-> db
-              (assoc-in [:logto :sign-in-session :code-verifier] code-verifier)
-              (assoc-in [:logto :sign-in-session :state] state))
-      :fx [[:dispatch [::save-sign-in-session]]
-           [:redirect auth-url]]})))
+ (fn [{:keys [db]} [_ callback-uri]]
+   {:fx [[:dispatch [::fetch-oidc-config callback-uri ::sign-in-fx]]]}))
 
-(rf/reg-fx
- :redirect
- (fn [url]
-   (set! (.-location js/window) url)))
+(re-frame/reg-event-fx
+ ::fetch-oidc-config
+ (fn [{:keys [db]} [_ callback-uri success-event]]
+   (http-oidc-config db callback-uri success-event)))
 
-(rf/reg-event-fx
- ::save-sign-in-session
- (fn [{:keys [db]} _]
-   (let [session (get-in db [:logto :sign-in-session])]
-     {:cookie/set {:name "logto_sign_in_session"
-                   :value (js/JSON.stringify (clj->js session))
-                   :expires cookie-expire-time}}))) ; 30 minutes
+(re-frame/reg-event-db
+ ::handle-failure-fetch-oidc-config
+ (fn [db [_ _]]
+   (-> db
+       (assoc :error "Error fetching OIDC config")
+       (assoc :oidc-config-loading? false))))
 
-(rf/reg-event-fx
+(re-frame/reg-event-fx
+ ::sign-in-fx
+ (fn [{:keys [db]} [_ redirect-uri response]]
+   (sign-in (conj (:auth-config db) {:oidc-config response}) redirect-uri)))
+
+;; SIGN IN CALLBACK
+
+(re-frame/reg-event-fx
  ::handle-sign-in-callback
  (fn [{:keys [db]} [_ callback-uri]]
-   (let [uri (js/URL. callback-uri)
-         query-params (parse-query-string (.-search uri))
-         code (get query-params "code")
-         state (get query-params "state")
-         session-str (.get Cookies "logto_sign_in_session")
-         session (js->clj (js/JSON.parse session-str) :keywordize-keys true)]
-     (if (and code (= state (:state session)))
-       {:db (assoc-in db [:logto :sign-in-session] session)
-        :fx [[:dispatch [::exchange-code code (:code-verifier session) (.-origin uri)]]]}
-       {:fx [[:dispatch [::sign-in-error "Invalid state parameter"]]]}))))
+   {:fx [[:dispatch [::fetch-oidc-config callback-uri ::handle-sign-in-callback-fx]]]}))
 
-(rf/reg-event-fx
- ::exchange-code
- (fn [{:keys [db]} [_ code code-verifier redirect-uri]]
-   (let [{:keys [app-id]} (get-in db [:logto :config])
-         token-endpoint (get-in db [:logto :oidc-config :token_endpoint])]
-     {:http-xhrio {:method :post
-                   :uri token-endpoint
-                   :body (query-string {:grant_type "authorization_code"
-                                        :code code
-                                        :client_id app-id
-                                        :redirect_uri redirect-uri
-                                        :code_verifier code-verifier})
-                   :format (ajax/url-request-format)
-                   :headers {"Content-Type" "application/x-www-form-urlencoded"}
-                   :response-format (ajax/json-response-format {:keywords? true})
-                   :on-success [::exchange-code-success]
-                   :on-failure [::request-failed]}})))
-
-(rf/reg-event-fx
- ::exchange-code-success
- (fn [{:keys [db]} [_ response]]
-   (let [{:keys [access_token refresh_token id_token expires_in]} response
-         now (js/Date.now)
-         expires-at (+ now (* expires_in 1000))]
-     {:db (-> db
-              (assoc-in [:logto :tokens :id-token] id_token)
-              (assoc-in [:logto :tokens :refresh-token] refresh_token)
-              (assoc-in [:logto :tokens :access-tokens "default"]
-                        {:token access_token :expires-at expires-at}))
-      :fx [[:dispatch [::verify-id-token id_token]]
-           [:dispatch [::get-user-info]]]})))
-
-(rf/reg-event-fx
- ::verify-id-token
- (fn [{:keys [db]} [_ id-token]]
-   (let [jwks (get-in db [:logto :jwks])
-         parts (str/split id-token #"\.")
-         header (js/JSON.parse (b64/decodeString (first parts)))
-         claims (js/JSON.parse (b64/decodeString (second parts)))
-         kid (:kid header)]
-     ;; In a real implementation, you'd verify the signature using the JWK with matching kid
-     ;; For simplicity, we're just checking claims here
-     (if (and (< (js/Date.now) (* (:exp claims) 1000))
-              (= (get-in db [:logto :config :app-id]) (:aud claims)))
-       {:db (assoc-in db [:logto :id-token-claims] claims)}
-       {:fx [[:dispatch [::sign-in-error "Invalid ID token"]]]}))))
-
-(rf/reg-event-fx
- ::get-user-info
- (fn [{:keys [db]} _]
-   (let [user-info-endpoint (get-in db [:logto :oidc-config :userinfo_endpoint])
-         access-token (get-in db [:logto :tokens :access-tokens "default" :token])]
-     {:http-xhrio {:method :get
-                   :uri user-info-endpoint
-                   :headers {"Authorization" (str "Bearer " access-token)}
-                   :response-format (ajax/json-response-format {:keywords? true})
-                   :on-success [::get-user-info-success]
-                   :on-failure [::request-failed]}})))
-
-(rf/reg-event-db
- ::get-user-info-success
+(re-frame/reg-event-fx
+ ::handle-sign-in-callback-fx
+ (fn [{:keys [db]} [_ callback-uri response]]
+   (let [sign-in-session (get-sign-in-session)]
+     (if (nil? sign-in-session)
+       {:fx [[:dispatch [::handle-failure-sign-in-callback "sign_in_session.not_found"]]]}
+       (let [{:keys [redirect-uri state code-verifier]} sign-in-session
+             {code :code verify-parse-error :error} (verify-and-parse-code-from-callback-uri callback-uri redirect-uri state)
+             {token-endpoint :token_endpoint jwks-uri :jwks_uri} response]
+         (if-not (nil? verify-parse-error)
+           {:fx [[:dispatch [::handle-failure-sign-in-callback verify-parse-error]]]}
+           {:fx [[:dispatch [::fetch-auth-token {:code code
+                                                 :client-id (get-in db [:auth-config :app-id])
+                                                 :token-endpoint token-endpoint
+                                                 :redirect-uri redirect-uri
+                                                 :code-verifier code-verifier
+                                                 :oidc-config response
+                                                 :auth-config (:auth-config db)}]]]}))))))
+(re-frame/reg-event-db
+ ::sign-in-callback-success
  (fn [db [_ response]]
-   (assoc-in db [:logto :user-info] response)))
+   (save-tokens! response)
+   (-> db
+       (assoc :error nil)
+       (assoc :oidc-config-loading? false)
+       (assoc :auth-token-loading? false)
+       (assoc :authenticated? true)
+       (assoc :auth-tokens response))))
 
-(rf/reg-event-fx
- ::get-access-token
- (fn [{:keys [db]} [_ resource scopes]]
-   (let [access-token-map (get-in db [:logto :tokens :access-tokens])
-         token-info (get access-token-map resource)
-         now (js/Date.now)]
-     (if (and token-info (> (:expires-at token-info) now))
-       {:db db} ; Token still valid
-       {:fx [[:dispatch [::refresh-access-token resource scopes]]]}))))
+(re-frame/reg-event-db
+ ::handle-failure-sign-in-callback
+ (fn [db [_ error-message]]
+   (-> db
+       (assoc :error (str "Authentication error: " error-message))
+       (assoc :oidc-config-loading? false)
+       (assoc :auth-token-loading? false)
+       (assoc :authenticated? false))))
 
-(rf/reg-event-fx
- ::refresh-access-token
- (fn [{:keys [db]} [_ resource scopes]]
-   (let [{:keys [app-id]} (get-in db [:logto :config])
-         token-endpoint (get-in db [:logto :oidc-config :token_endpoint])
-         refresh-token (get-in db [:logto :tokens :refresh-token])
-         scope-param (when scopes (str/join " " scopes))]
-     {:http-xhrio {:method :post
-                   :uri token-endpoint
-                   :body (query-string
-                          (cond-> {:grant_type "refresh_token"
-                                   :client_id app-id
-                                   :refresh_token refresh-token}
-                            resource (assoc :resource resource)
-                            scope-param (assoc :scope scope-param)))
-                   :format (ajax/url-request-format)
-                   :headers {"Content-Type" "application/x-www-form-urlencoded"}
-                   :response-format (ajax/json-response-format {:keywords? true})
-                   :on-success [::refresh-token-success resource]
-                   :on-failure [::request-failed]}})))
+(re-frame/reg-event-fx
+ ::verify-id-token
+ (fn [{:keys [db]} [_ response]]
+   (let [decoded-jwt (decode-jwt-payload (:id_token response))]
+     (when (nil? decoded-jwt)
+       {:fx [[:dispatch [::handle-failure-sign-in-callback "Error decoding JWT on verify-id-token event: Invalid JWT"]]]})
+     (when (token-expired? decoded-jwt)
+       {:fx [[:dispatch [::handle-failure-sign-in-callback "Error decoding JWT on verify-id-token event: Token expired"]]]})
+     {:fx [[:dispatch [::sign-in-callback-success response]]]})))
 
-(rf/reg-event-db
- ::refresh-token-success
- (fn [db [_ resource response]]
-   (let [{:keys [access_token refresh_token expires_in]} response
-         now (js/Date.now)
-         expires-at (+ now (* expires_in 1000))]
-     (-> db
-         (assoc-in [:logto :tokens :access-tokens resource]
-                   {:token access_token :expires-at expires-at})
-         (cond-> refresh_token (assoc-in [:logto :tokens :refresh-token] refresh_token))))))
+(re-frame/reg-event-fx
+ ::fetch-auth-token
+ (fn [{:keys [db]} [_ payload]]
+   {:db   (assoc db :auth-token-loading? true)
+    :http-xhrio {:method          :post
+                 :uri             (:token-endpoint payload)
+                 :body          (js/URLSearchParams. (clj->js {:client_id (:client-id payload)
+                                                               :code (:code payload)
+                                                               :code_verifier (:code-verifier payload)
+                                                               :redirect_uri (:redirect-uri payload)
+                                                               :grant_type "authorization_code"}))
+                 :headers         {"Content-Type" "application/x-www-form-urlencoded"}
+                 :timeout         5000
+                 :response-format (ajax/json-response-format {:keywords? true})
+                 :on-success      [::verify-id-token]
+                 :on-failure      [::handle-failure-sign-in-callback]}}))
 
-(rf/reg-event-db
- ::sign-out
- (fn [db _]
-   (update db :logto dissoc :tokens :user-info :id-token-claims)))
+;; Subscriptions
+(re-frame/reg-sub
+ ::authenticated?
+ (fn [db]
+   (:authenticated? db)))
 
-(rf/reg-event-db
- ::request-failed
- (fn [db [_ error]]
-   (assoc-in db [:logto :error] error)))
+(re-frame/reg-sub
+ ::auth-token-loading?
+ (fn [db]
+   (:auth-token-loading? db)))
 
-;; --- Subscriptions ---
-(rf/reg-sub
- ::config
- (fn [db _]
-   (get-in db [:logto :config])))
+(re-frame/reg-sub
+ ::error
+ (fn [db]
+   (:error db)))
 
-(rf/reg-sub
- ::is-authenticated
- (fn [db _]
-   (boolean (get-in db [:logto :tokens :id-token]))))
+(re-frame/reg-sub
+ ::logto-base-endpoint
+ (fn [db]
+   (:logto-base-endpoint db)))
 
-(rf/reg-sub
- ::user-info
- (fn [db _]
-   (get-in db [:logto :user-info])))
+(re-frame/reg-sub
+ ::auth-config
+ (fn [db]
+   (:auth-config db)))
 
-(rf/reg-sub
- ::id-token
- (fn [db _]
-   (get-in db [:logto :tokens :id-token])))
-
-(rf/reg-sub
- ::access-token
- (fn [db [_ resource]]
-   (let [resource-key (or resource "default")
-         token-info (get-in db [:logto :tokens :access-tokens resource-key])]
-     (when (and token-info (> (:expires-at token-info) (js/Date.now)))
-       (:token token-info)))))
-
-(rf/reg-sub
+(re-frame/reg-sub
  ::error
  (fn [db _]
    (get-in db [:logto :error])))
 
-;; --- Cookie fx ---
-(rf/reg-fx
- :cookie/set
- (fn [{:keys [name value expires]}]
-   (.set Cookies name value #js {:expires expires})))
-
-(rf/reg-fx
- :cookie/remove
- (fn [name]
-   (.remove Cookies name)))
+;; --- Cookie fx --- (TODO: might be invalid. or can be used as replacement for the save-tokens! function above)
+;; (rf/reg-fx
+;;  :cookie/set
+;;  (fn [{:keys [name value expires]}]
+;;    (.set Cookies name value #js {:expires expires})))
+;; 
+;; (rf/reg-fx
+;;  :cookie/remove
+;;  (fn [name]
+;;    (.remove Cookies name)))
 
 (js/console.log "logto-client.core loaded")
